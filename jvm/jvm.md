@@ -939,3 +939,654 @@ java \
   - **数值大于默认值**，避免频繁触发 Full GC。
   - 例如：
     - 机器内存 8G → 一般设为 `256M`。
+
+---
+
+# JVM对象创建与内存分配机制深度剖析
+
+## 🛠️ 类加载与内存分配流程
+
+![对象的创建](img\对象的创建.png)
+
+### **🔍 1. 类加载检查**
+
+虚拟机遇到 `new` 指令时，首先检查参数是否能在常量池中找到类的符号引用，并且确认该类是否已经加载、解析和初始化。如果没有，必须执行相应的类加载过程。
+ `new` 指令包括语言层面的 `new` 关键字、对象克隆、对象序列化等。
+
+------
+
+### **💾 2. 分配内存**
+
+在类加载检查通过后，虚拟机为新生对象分配内存。对象所需内存大小在类加载后已经确定，内存分配任务就是从 Java 堆中划分出一块内存。
+
+#### 划分内存方法：
+
+- **🪙 指针碰撞**
+   如果 Java 堆内存是规整的，已使用内存和空闲内存分开，指针作为分界点指示，分配内存时仅需将指针移动。
+- **📋 空闲列表**
+   如果内存交错，虚拟机维护一个空闲内存块的列表，在分配时从中找到足够大的空间。
+
+#### 解决并发问题的方法：
+
+- **🔄 CAS (Compare And Swap)**
+   使用 CAS 配合失败重试机制保证内存分配的原子性。
+- **🧵 本地线程分配缓冲（TLAB）**
+   每个线程有独立的小块内存进行分配，虚拟机默认开启。
+   使用 `-XX:+UseTLAB` 参数控制是否启用，`-XX:TLABSize` 设置 TLAB 的大小。
+
+------
+
+### **⚙️ 3. 初始化零值**
+
+内存分配后，虚拟机会将内存空间初始化为零值（不包括对象头）。如果使用 TLAB，这一步可以提前完成。
+初始化零值确保对象字段在未赋值时使用零值，可以直接在代码中访问。
+
+------
+
+### 🔑 4. **设置对象头**
+
+虚拟机对对象设置必要信息，例如：
+
+- 对象所属类的信息
+- 对象的哈希码
+- GC 分代年龄等
+   这些信息存储在 **对象头** 中。
+
+在 HotSpot 虚拟机中，对象内存布局包括三个区域：
+
+1. **🛠️ 对象头**
+2. **📊 实例数据**
+3. **🔳 对齐填充**
+
+**对象头（Header）** 包括：
+
+- 运行时数据，如哈希码、GC分代年龄、锁状态标志、线程持有的锁等
+- 类型指针，指向对象所属类的元数据
+
+#### 32位对象头示意：
+
+![对象头](img\对象头.png)
+
+------
+
+### ⚡ 5. **执行方法**
+
+对象初始化后，根据程序员的意图执行赋值和构造方法。
+ 此步骤与零值初始化不同，程序员明确给属性赋值。
+
+------
+
+### 🔒 6. **对象半初始化**
+
+- **📏 对象大小与指针压缩**
+   对象的大小可以通过使用 `jol-core` 包进行查看。
+
+```xml
+<dependency>
+    <groupId>org.openjdk.jol</groupId>
+    <artifactId>jol-core</artifactId>
+    <version>0.9</version>
+</dependency>
+```
+
+```java
+import org.openjdk.jol.info.ClassLayout;
+
+/**
+ * 计算对象大小
+ */
+public class JOLSample {
+
+    public static void main(String[] args) {
+        ClassLayout layout = ClassLayout.parseInstance(new Object());
+        System.out.println(layout.toPrintable());
+
+        System.out.println();
+        ClassLayout layout1 = ClassLayout.parseInstance(new int[]{});
+        System.out.println(layout1.toPrintable());
+
+        System.out.println();
+        ClassLayout layout2 = ClassLayout.parseInstance(new A());
+        System.out.println(layout2.toPrintable());
+    }
+
+    // -XX:+UseCompressedOops           默认开启的压缩所有指针
+    // -XX:+UseCompressedClassPointers  默认开启的压缩对象头里的类型指针Klass Pointer
+    // Oops : Ordinary Object Pointers
+    public static class A {
+                       //8B mark word
+                       //4B Klass Pointer   如果关闭压缩-XX:-UseCompressedClassPointers或-XX:-UseCompressedOops，则占用8B
+        int id;        //4B
+        String name;   //4B  如果关闭压缩-XX:-UseCompressedOops，则占用8B
+        byte b;        //1B 
+        Object o;      //4B  如果关闭压缩-XX:-UseCompressedOops，则占用8B
+    }
+}
+
+
+运行结果：
+java.lang.Object object internals:
+ OFFSET  SIZE   TYPE DESCRIPTION                               VALUE
+      0     4        (object header)                           01 00 00 00 (00000001 00000000 00000000 00000000) (1)    //mark word
+      4     4        (object header)                           00 00 00 00 (00000000 00000000 00000000 00000000) (0)    //mark word     
+      8     4        (object header)                           e5 01 00 f8 (11100101 00000001 00000000 11111000) (-134217243)    //Klass Pointer
+     12     4        (loss due to the next object alignment)
+Instance size: 16 bytes
+Space losses: 0 bytes internal + 4 bytes external = 4 bytes total
+
+
+[I object internals:
+ OFFSET  SIZE   TYPE DESCRIPTION                               VALUE
+      0     4        (object header)                           01 00 00 00 (00000001 00000000 00000000 00000000) (1)
+      4     4        (object header)                           00 00 00 00 (00000000 00000000 00000000 00000000) (0)
+      8     4        (object header)                           6d 01 00 f8 (01101101 00000001 00000000 11111000) (-134217363)
+     12     4        (object header)                           00 00 00 00 (00000000 00000000 00000000 00000000) (0)
+     16     0    int [I.<elements>                             N/A
+Instance size: 16 bytes
+Space losses: 0 bytes internal + 0 bytes external = 0 bytes total
+
+
+com.tuling.jvm.JOLSample$A object internals:
+ OFFSET  SIZE               TYPE DESCRIPTION                               VALUE
+      0     4                    (object header)                           01 00 00 00 (00000001 00000000 00000000 00000000) (1)
+      4     4                    (object header)                           00 00 00 00 (00000000 00000000 00000000 00000000) (0)
+      8     4                    (object header)                           61 cc 00 f8 (01100001 11001100 00000000 11111000) (-134165407)
+     12     4                int A.id                                      0
+     16     1               byte A.b                                       0
+     17     3                    (alignment/padding gap)                  
+     20     4   java.lang.String A.name                                    null
+     24     4   java.lang.Object A.o                                       null
+     28     4                    (loss due to the next object alignment)
+Instance size: 32 bytes
+Space losses: 3 bytes internal + 4 bytes external = 7 bytes total
+```
+
+什么是java对象的**指针压缩**？
+
+1.jdk1.6 update14开始，在64bit操作系统中，JVM支持指针压缩
+
+2.jvm配置参数:UseCompressedOops，compressed--压缩、oop(ordinary object pointer)--对象指针
+
+3.启用指针压缩:-XX:+UseCompressedOops(**默认开启**)，禁止指针压缩:-XX:-UseCompressedOops
+
+为什么要进行指针压缩？
+
+1.在64位平台的HotSpot中使用32位指针(实际存储用64位)，内存使用会多出1.5倍左右，使用较大指针在主内存和缓存之间移动数据，**占用较大宽带，同时GC也会承受较大压力**
+
+2.为了减少64位平台下内存的消耗，启用指针压缩功能
+
+3.在jvm中，32位地址最大支持4G内存(2的32次方)，可以通过对对象指针的存入**堆内存**时压缩编码、取出到**cpu寄存器**后解码方式进行优化(对象指针在堆中是32位，在寄存器中是35位，2的35次方=32G)，使得jvm只用32位地址就可以支持更大的内存配置(小于等于32G)
+
+4.堆内存小于4G时，不需要启用指针压缩，jvm会直接去除高32位地址，即使用低虚拟地址空间
+
+5.堆内存大于32G时，压缩指针会失效，会强制使用64位(即8字节)来对java对象寻址，这就会出现1的问题，所以堆内存不要大于32G为好
+
+**关于对齐填充：**对于大部分处理器，对象以8字节整数倍来对齐填充都是最高效的存取方式。
+
+## 🛠️ **Java 对象的指针压缩**
+
+### 🔍1. **什么是指针压缩？**
+
+指针压缩是 JVM 在 64 位操作系统中，优化对象指针存储的技术。从 **JDK 1.6 Update 14** 开始，JVM 支持在 64 位平台上使用压缩指针，目的是减少内存的使用。
+
+- **32 位指针**：在堆内存中使用 32 位指针（4 字节），而在 CPU 寄存器中保持 64 位指针。
+- **启用指针压缩**：通过在堆内存中存储 32 位指针，能够节省大量内存。
+
+### ⚙️2. JVM 配置参数
+
+- **`UseCompressedOops`**: 启用指针压缩。
+  - 启用：`-XX:+UseCompressedOops`（默认开启）
+  - 禁用：`-XX:-UseCompressedOops`
+
+------
+
+### 💡3. **为什么要进行指针压缩？**
+
+#### 💰 1. **减少内存消耗**
+
+- **64 位指针**：每个对象会占用 8 字节的指针内存。
+- **32 位指针**：通过压缩，每个对象只占用 4 字节的指针内存，减少了大约 1.5 倍的内存消耗。
+
+#### 🚀 2. **提高性能**
+
+- **带宽问题**：较大的指针占用更多带宽，且 GC 会承受更大压力。
+- **减少内存带宽压力**：指针压缩减少了内存占用，有助于提高内存带宽和缓存的效率。
+
+#### 🧑‍💻 3. **支持更大内存配置**
+
+- **32 位指针**：能够支持最大 **32GB** 的内存，通过对象指针的压缩编码和解码来优化内存。
+  - 在堆内存中，指针为 32 位，而在 CPU 寄存器中为 64 位，能够处理更大的内存空间。
+
+------
+
+### 📏 4. **内存大小与指针压缩使用**
+
+#### 🔽 1. **堆内存小于 4G**
+
+指针压缩不需要启用，JVM 会直接使用低虚拟地址空间。
+
+#### 🔼 2. **堆内存大于 4G 小于 32G**
+
+启用指针压缩，JVM 使用 32 位指针，能够有效减少内存使用。
+
+#### ⚠️ 3. **堆内存大于 32G**
+
+指针压缩会失效，强制使用 64 位指针，导致内存占用增加，建议堆内存不要超过 32GB。
+
+------
+
+### 📊5. 如何工作
+
+- **编码与解码**：在堆内存中，指针是 32 位；在寄存器中，指针解码为 64 位。
+- **最大支持 32GB 内存**：通过 32 位压缩指针和 64 位解压指针，可以在 64 位系统上有效地支持更大的内存空间。
+
+------
+
+### 🧰6. 对齐填充
+
+- **对齐优化**：大多数处理器在内存访问时，采用 8 字节对齐来提高效率。JVM 会确保对象按 8 字节对齐，从而提升对象的访问速度。
+
+---
+
+## 🏗️ **对象内存分配**
+
+### 📊 1. **对象内存分配流程图**
+
+![对象内存分配流程图](img\对象内存分配流程图.png)
+
+### 💡 2. 对象栈上分配
+
+Java 中的对象通常是在 **堆上** 进行分配的。当对象没有被引用时，垃圾回收器（GC）会负责回收它们的内存。然而，当对象数量较多时，GC 的负担会增加，从而影响应用程序的性能。
+
+为了减少临时对象在堆内分配的数量，JVM 通过 **逃逸分析** 来判断某个对象是否会被外部访问。如果对象不会逃逸，则可以将该对象 **栈上分配**。栈上分配的对象会随着栈帧的出栈而销毁，从而减轻 GC 的压力。
+
+**对象逃逸分析**
+
+对象逃逸分析就是通过分析对象的动态作用域，判断它是否会被外部方法所引用。例如，如果对象作为参数传递到其他方法，就算它在当前方法中创建，作用域就会“逃逸”到外部。
+
+------
+
+### 🧑‍💻 3. **示例：逃逸分析与栈上分配**
+
+```java
+public User test1() {
+   User user = new User();
+   user.setId(1);
+   user.setName("zhuge");
+   //TODO 保存到数据库
+   return user;
+}
+
+public void test2() {
+   User user = new User();
+   user.setId(1);
+   user.setName("zhuge");
+   //TODO 保存到数据库
+}
+```
+
+- **`test1` 方法** 中的 `user` 对象被返回，作用域不明确，可能会逃逸。
+- **`test2` 方法** 中的 `user` 对象，在方法结束后不再被引用，可以认为它是无效对象，适合栈上分配。
+
+JVM 在开启逃逸分析的情况下，可以通过 **标量替换** 将这些临时对象分配到栈上，避免堆内存分配和 GC 的压力。
+
+------
+
+### 🔧 4. **JVM 参数**
+
+- **开启逃逸分析**：`-XX:+DoEscapeAnalysis`（JDK 7+ 默认开启）
+- **关闭逃逸分析**：`-XX:-DoEscapeAnalysis`
+- **开启标量替换**：`-XX:+EliminateAllocations`（JDK 7+ 默认开启）
+- **关闭标量替换**：`-XX:-EliminateAllocations`
+
+------
+
+### 🔍 5. **标量替换**
+
+当逃逸分析确认一个对象不会被外部访问且能够进一步分解时，JVM 不会创建该对象，而是将其成员变量分解为多个独立的成员变量，在栈帧或寄存器中分配内存。这样可以避免因为没有连续的大块内存而导致对象内存分配失败。
+
+**标量与聚合量**：
+
+- **标量**：不可进一步分解的基本类型（如 `int`, `long`）和引用类型。
+- **聚合量**：可以进一步分解的复杂对象（如 `User` 类对象）。
+
+------
+
+### 🏃‍♂️ 6. **栈上分配示例**
+
+```java
+/**
+ * 栈上分配，标量替换
+ * 代码调用了1亿次alloc()，如果是分配到堆上，大概需要1GB以上堆空间，
+ * 如果堆空间小于该值，必然会触发GC。
+ * 
+ * 使用如下参数不会发生GC：
+ * -Xmx15m -Xms15m -XX:+DoEscapeAnalysis -XX:+PrintGC -XX:+EliminateAllocations
+ * 使用如下参数都会发生大量GC：
+ * -Xmx15m -Xms15m -XX:-DoEscapeAnalysis -XX:+PrintGC -XX:+EliminateAllocations
+ * -Xmx15m -Xms15m -XX:+DoEscapeAnalysis -XX:+PrintGC -XX:-EliminateAllocations
+ */
+public class AllotOnStack {
+
+    public static void main(String[] args) {
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < 100000000; i++) {
+            alloc();
+        }
+        long end = System.currentTimeMillis();
+        System.out.println(end - start);
+    }
+
+    private static void alloc() {
+        User user = new User();
+        user.setId(1);
+        user.setName("zhuge");
+    }
+}
+```
+
+**结论：栈上分配依赖于逃逸分析和标量替换**
+
+---
+
+## 🏗️ **对象在 Eden 区分配**
+
+### 📊 1. **Eden 区分配与 Minor GC**
+
+大多数情况下，对象会在 **新生代的 Eden 区** 中进行分配。当 Eden 区没有足够的空间时，JVM 会发起一次 **Minor GC**。在 **Minor GC** 过程中，新生代的对象会被清理，未被回收的存活对象会被移到 **Survivor 区** 或 **老年代**。
+
+------
+
+### ⚙️ 2. **Minor GC vs Full GC**
+
+**Minor GC / Young GC**：
+
+- 发生在新生代的垃圾回收。
+- 频繁且回收速度较快。
+
+**Major GC / Full GC**：
+
+- 发生在新生代、老年代和方法区。
+- 通常比 Minor GC 慢 10 倍以上。
+
+------
+
+### 💡 3. **Eden 区与 Survivor 区比例 (默认 8:1:1)**
+
+- 大多数对象被分配到 Eden 区，当 Eden 区满了时，会触发 **Minor GC**，大部分对象会被回收。
+- 存活的对象会被移动到空闲的 Survivor 区。
+- 默认比例为 **8:1:1**，即 Eden 区占 8 倍于 Survivor 区的大小。
+  - **Eden 区大，Survivor 区小**，这样可以最大限度地利用 Eden 区的空间。
+- 默认启用 **-XX:+UseAdaptiveSizePolicy**，该参数会动态调整比例。如果需要禁用自动调整，使用 **-XX:-UseAdaptiveSizePolicy**。
+
+### 🧑‍💻 4. 示例：Eden 区的内存分配
+
+```java
+//添加运行JVM参数： -XX:+PrintGCDetails
+public class GCTest {
+   public static void main(String[] args) throws InterruptedException {
+      byte[] allocation1, allocation2/*, allocation3, allocation4, allocation5, allocation6*/;
+      allocation1 = new byte[60000*1024];
+
+      //allocation2 = new byte[8000*1024];
+
+      /*allocation3 = new byte[1000*1024];
+     allocation4 = new byte[1000*1024];
+     allocation5 = new byte[1000*1024];
+     allocation6 = new byte[1000*1024];*/
+   }
+}
+
+运行结果：
+Heap
+ PSYoungGen      total 76288K, used 65536K [0x000000076b400000, 0x0000000770900000, 0x00000007c0000000)
+  eden space 65536K, 100% used [0x000000076b400000,0x000000076f400000,0x000000076f400000)
+  from space 10752K, 0% used [0x000000076fe80000,0x000000076fe80000,0x0000000770900000)
+  to   space 10752K, 0% used [0x000000076f400000,0x000000076f400000,0x000000076fe80000)
+ ParOldGen       total 175104K, used 0K [0x00000006c1c00000, 0x00000006cc700000, 0x000000076b400000)
+  object space 175104K, 0% used [0x00000006c1c00000,0x00000006c1c00000,0x00000006cc700000)
+ Metaspace       used 3342K, capacity 4496K, committed 4864K, reserved 1056768K
+  class space    used 361K, capacity 388K, committed 512K, reserved 1048576K
+```
+
+我们可以看出eden区内存几乎已经被分配完全（即使程序什么也不做，新生代也会使用至少几M内存）。**假如我们再为allocation2分配内存会出现什么情况呢？**
+
+```java
+//添加运行JVM参数： -XX:+PrintGCDetails
+public class GCTest {
+   public static void main(String[] args) throws InterruptedException {
+      byte[] allocation1, allocation2/*, allocation3, allocation4, allocation5, allocation6*/;
+      allocation1 = new byte[60000*1024];
+
+      allocation2 = new byte[8000*1024];
+
+      /*allocation3 = new byte[1000*1024];
+      allocation4 = new byte[1000*1024];
+      allocation5 = new byte[1000*1024];
+      allocation6 = new byte[1000*1024];*/
+   }
+}
+
+运行结果：
+[GC (Allocation Failure) [PSYoungGen: 65253K->936K(76288K)] 65253K->60944K(251392K), 0.0279083 secs] [Times: user=0.13 sys=0.02, real=0.03 secs] 
+Heap
+ PSYoungGen      total 76288K, used 9591K [0x000000076b400000, 0x0000000774900000, 0x00000007c0000000)
+  eden space 65536K, 13% used [0x000000076b400000,0x000000076bc73ef8,0x000000076f400000)
+  from space 10752K, 8% used [0x000000076f400000,0x000000076f4ea020,0x000000076fe80000)
+  to   space 10752K, 0% used [0x0000000773e80000,0x0000000773e80000,0x0000000774900000)
+ ParOldGen       total 175104K, used 60008K [0x00000006c1c00000, 0x00000006cc700000, 0x000000076b400000)
+  object space 175104K, 34% used [0x00000006c1c00000,0x00000006c569a010,0x00000006cc700000)
+ Metaspace       used 3342K, capacity 4496K, committed 4864K, reserved 1056768K
+  class space    used 361K, capacity 388K, committed 512K, reserved 1048576K
+```
+
+**解释：**
+
+当 Eden 区内存几乎被分配完时，虚拟机会触发 **Minor GC**。在 GC 过程中，存活的对象会被移动到 Survivor 区。如果 Survivor 区空间不足，一部分对象会被提前转移到 **老年代**。这次 **Minor GC** 后，分配的对象可以继续在 Eden 区中分配内存。
+
+### 🔧 5. **示例：更多对象分配**
+
+```java
+public class GCTest {
+   public static void main(String[] args) throws InterruptedException {
+      byte[] allocation1, allocation2, allocation3, allocation4, allocation5, allocation6;
+      allocation1 = new byte[60000 * 1024];  // 60MB
+      allocation2 = new byte[8000 * 1024];   // 8MB
+      allocation3 = new byte[1000 * 1024];   // 1MB
+      allocation4 = new byte[1000 * 1024];   // 1MB
+      allocation5 = new byte[1000 * 1024];   // 1MB
+      allocation6 = new byte[1000 * 1024];   // 1MB
+   }
+}
+```
+
+**运行结果**：
+
+```java
+[GC (Allocation Failure) [PSYoungGen: 65253K->952K(76288K)] 65253K->60960K(251392K), 0.0311467 secs]
+Heap
+ PSYoungGen      total 76288K, used 13878K [0x000000076b400000, 0x0000000774900000, 0x00000007c0000000)
+  eden space 65536K, 19% used [0x000000076b400000,0x000000076c09fb68,0x000000076f400000)
+  from space 10752K, 8% used [0x000000076f400000,0x000000076f4ee030,0x000000076fe80000)
+  to   space 10752K, 0% used [0x0000000773e80000,0x0000000773e80000,0x0000000774900000)
+ ParOldGen       total 175104K, used 60008K [0x00000006c1c00000, 0x00000006cc700000, 0x000000076b400000)
+  object space 175104K, 34% used [0x00000006c1c00000,0x00000006c569a010,0x00000006cc700000)
+ Metaspace       used 3343K, capacity 4496K, committed 4864K, reserved 1056768K
+  class space    used 361K, capacity 388K, committed 512K, reserved 1048576K
+```
+
+---
+
+## 📦 大对象直接进入老年代
+
+**大对象**是指需要大量连续内存空间的对象，例如字符串或数组。为了优化内存分配效率，JVM提供了参数-XX:PretenureSizeThreshold来设置大对象的大小阈值。如果对象大小超过该阈值，将直接进入**老年代**，而不会进入年轻代。此参数仅在**Serial**和**ParNew**垃圾收集器下有效。
+
+### 🛠 示例
+
+设置JVM参数：
+-XX:PretenureSizeThreshold=1000000（单位：字节）
+-XX:+UseSerialGC
+
+运行程序后，若对象大小超过1000000字节，该对象将直接分配到老年代。
+
+### ❓ 为什么要这样做？
+
+为避免大对象在年轻代进行复制操作（Copying算法）时降低效率，直接分配到老年代可以减少性能开销。
+
+------
+
+## ⏳ 长期存活的对象进入老年代
+
+JVM采用**分代收集**策略管理内存，需区分对象应分配在**新生代**还是**老年代**。为此，JVM为每个对象设置了一个**年龄计数器（Age）**。
+
+### 🔄 对象年龄机制
+
+1. 对象在**Eden区**创建，经过第一次**Minor GC**后若仍存活且能被**Survivor区**容纳，则被移至Survivor区，年龄设为1。
+2. 每次在Survivor区经历Minor GC，年龄+1。
+3. 当对象年龄达到阈值（默认15岁，CMS收集器默认6岁，可通过-XX:MaxTenuringThreshold设置），对象晋升到**老年代**。
+
+### 🎯 动态年龄判断
+
+当**Survivor区**中一批对象的总大小超过该区域内存的50%（可通过-XX:TargetSurvivorRatio设置），年龄**大于等于**该批对象中最大年龄的对象将直接进入老年代。
+
+**示例**：
+若Survivor区中年龄1+年龄2+...+年龄n的对象总和超过Survivor区50%，则年龄≥n的对象直接晋升老年代。此机制在**Minor GC**后触发，旨在让可能长期存活的对象尽早进入老年代。
+
+---
+
+## 🛡️ 老年代空间分配担保机制
+
+在**Minor GC**之前，JVM会检查老年代的剩余可用空间：
+
+1. 若老年代可用空间 < 年轻代所有对象（包括垃圾对象）大小之和，JVM会检查是否设置了-XX:-HandlePromotionFailure（JDK 1.8默认开启）。
+2. 若设置了该参数，JVM会比较老年代可用空间与每次Minor GC后进入老年代对象的**平均大小**：
+   - 若老年代可用空间 ≥ 平均大小，继续执行Minor GC。
+   - 若小于或未设置该参数，触发**Full GC**，同时回收老年代和年轻代。
+3. 若Minor GC后存活对象仍无法放入老年代（老年代空间不足），再次触发Full GC。
+4. 若Full GC后仍无足够空间，则抛出**OutOfMemoryError (OOM)**。
+
+![空间分配担保](img\空间分配担保.png)
+
+---
+
+## 🗑️ 对象内存回收
+
+垃圾回收的第一步是判断哪些对象已“死亡”（即无法被任何途径使用）。
+
+### 🔢 引用计数法
+
+为对象添加一个引用计数器：
+
+- 每次被引用，计数器+1。
+- 引用失效，计数器-1。
+- 计数器为0的对象视为不可用。
+
+**缺点**：无法解决对象间的**循环引用**问题。例如：
+
+```java
+public class ReferenceCountingGc {
+   Object instance = null;
+
+   public static void main(String[] args) {
+      ReferenceCountingGc objA = new ReferenceCountingGc();
+      ReferenceCountingGc objB = new ReferenceCountingGc();
+      objA.instance = objB;
+      objB.instance = objA;
+      objA = null;
+      objB = null;
+   }
+}
+```
+
+### 🌳 可达性分析算法
+
+**可达性分析算法**用于判断对象是否为垃圾对象。算法以**GC Roots**为起点，沿引用链向下搜索，所有被标记的对象为**非垃圾对象**，未标记的对象则为**垃圾对象**。
+
+#### 🔗 GC Roots
+
+GC Roots包括以下节点：
+
+- **线程栈的本地变量**（如方法中的局部变量）
+- **静态变量**（类中定义的static变量）
+- **本地方法栈的变量**（Native方法引用的对象）
+- 其他（如常量池中的引用）
+
+![可达性](img\可达性.jpeg)
+
+### 🔗 常见引用类型
+
+Java提供四种引用类型，强度从高到低依次为：
+
+1. **强引用**
+   普通变量引用，GC不会回收。
+
+   ```java
+   public static User user = new User();
+   ```
+
+2. **软引用**
+   使用SoftReference包裹，正常情况下不会被回收，但若GC后内存仍不足，则会被回收。常用于**内存敏感的缓存**（如浏览器后退功能）。
+
+   ```java
+   public static SoftReference<User> user = new SoftReference<User>(new User());
+   ```
+
+   **应用场景**：
+
+   - 若网页在浏览结束时回收，按后退需重新请求页面。
+   - 若全部存储在内存，可能导致内存浪费或溢出。软引用可平衡性能与内存使用。
+
+3. **弱引用**
+   使用WeakReference包裹，GC时直接回收，类似无引用状态，使用较少。
+
+   ```java
+   public static WeakReference<User> user = new WeakReference<User>(new User());
+   ```
+
+4. **虚引用**
+   也称幽灵引用或幻影引用，是最弱的引用类型，几乎不用。
+
+------
+
+### ⚖️ finalize()方法与对象存活判定
+
+即使对象在可达性分析中不可达，仍有机会通过finalize()方法“自救”。对象死亡需经历**两次标记**：
+
+1. **第一次标记与筛选**
+   - 若对象未覆盖finalize()方法，直接回收。
+   - 若覆盖了finalize()，进入“缓刑”阶段，等待第二次标记。
+2. **第二次标记**
+   - 在finalize()中，对象可通过与引用链上的对象建立关联（例如赋给类变量）避免回收。
+   - 若未成功自救，对象将被回收。
+   - **注意**：finalize()仅执行一次，自救机会只有一次。
+
+```java
+public class OOMTest {
+
+   public static void main(String[] args) {
+      List<Object> list = new ArrayList<>();
+      int i = 0;
+      int j = 0;
+      while (true) {
+         list.add(new User(i++, UUID.randomUUID().toString()));
+         new User(j--, UUID.randomUUID().toString());
+      }
+   }
+}
+
+
+//User类需要重写finalize方法
+@Override
+protected void finalize() throws Throwable {
+    OOMTest.list.add(this);
+    System.out.println("关闭资源，userid=" + id + "即将被回收");
+}
+```
+
+### 🧹 如何判断一个类是无用的类
+
+在JVM中，**方法区**主要负责回收**无用类**。一个类被认为是**无用类**，需同时满足以下三个条件：
+
+1. **该类的所有对象实例已被回收** Java堆中不存在该类的任何实例，即该类的对象全部被垃圾回收器回收。
+2. **加载该类的ClassLoader已被回收** 该类的类加载器（如自定义ClassLoader）本身必须已被垃圾回收，否则类无法被卸载。
+3. **该类对应的java.lang.Class对象未被引用** 该类的java.lang.Class对象在任何地方都没有被引用，且无法通过反射（如Class.forName()或方法调用）访问该类的任何方法。
